@@ -48,12 +48,17 @@ try:
     from sklearn.ensemble import RandomForestRegressor  # type: ignore[reportMissingImports]
     from sklearn.linear_model import LinearRegression  # type: ignore[reportMissingImports]
     from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score  # type: ignore[reportMissingImports]
+    # IterativeImputer is in sklearn.experimental; the enable import must come
+    # BEFORE the sklearn.impute import below.
+    from sklearn.experimental import enable_iterative_imputer  # noqa: F401  # type: ignore[reportMissingImports]
+    from sklearn.impute import IterativeImputer  # type: ignore[reportMissingImports]
     HAS_SKLEARN = True
 except ImportError:
     GroupShuffleSplit = None
     StandardScaler = None
     RandomForestRegressor = None
     LinearRegression = None
+    IterativeImputer = None
     mean_squared_error = None
     mean_absolute_error = None
     r2_score = None
@@ -100,13 +105,13 @@ RANDOM_STATE = 42
 
 # Standard name -> alternative mnemonics in PRIORITY ORDER (first match wins)
 LAS_ALIASES = {
-    'GR':   ['GR', 'SGR', 'GRD', 'CGR', 'GAM'],
-    'RHOB': ['RHOB', 'DEN', 'ZDEN', 'RHOZ', 'BD'],
-    'NPHI': ['NPHI', 'CNC', 'NPHI_LS', 'PHIN', 'HNPHI'],
-    'ILD':  ['ILD', 'LLD', 'RT', 'AT90', 'AHT90', 'RDEP','RES'],
-    'CALI': ['CALI', 'CAL', 'CALS', 'HCAL'],
-    'DT':   ['DT', 'DTCO', 'AC', 'SONI', 'DTP'],
-    'DTS':  ['DTS', 'DTSM', 'DTSH', 'DTSD', 'DT_SHEAR', 'SDT'],
+    'GR':   ['GR', 'GEO_GR', 'SGR', 'GRD', 'CGR', 'GAM'],
+    'RHOB': ['RHOB', 'GEO_RHOB', 'GEO_DEN', 'DEN', 'ZDEN', 'RHOZ', 'BD'],
+    'NPHI': ['NPHI', 'GEO_NPHI', 'CNC', 'NPHI_LS', 'PHIN', 'HNPHI'],
+    'ILD':  ['ILD', 'GEO_ILD', 'GEO_RT', 'GEO_RES', 'LLD', 'RT', 'AT90', 'AHT90', 'RDEP'],
+    'CALI': ['CALI', 'GEO_CALI', 'GEO_CAL', 'CAL', 'CALS', 'HCAL'],
+    'DT':   ['DT', 'GEO_DT', 'GEO_DTCO', 'DTCO', 'AC', 'SONI', 'DTP'],
+    'DTS':  ['DTS', 'GEO_DTS', 'GEO_DTSM', 'DTSM', 'DTSH', 'DTSD', 'DT_SHEAR', 'SDT'],
 }
 
 # Logs the app can predict. key -> label shown in the UI
@@ -234,16 +239,28 @@ LOG_SCALE_CURVES = {'ILD'}
 
 
 def clean_data(df, feature_curves, limits, spike_pct=0.0, require_target=True,
-               return_report=False, target='DT'):
-    """Remove outliers from ALL logs, drop unusable rows, add log10 resistivity.
+               return_report=False, target='DT', fill_max_gap=0,
+               impute_cross_logs=False):
+    """Remove outliers, fill short gaps, drop unusable rows, add log10 resistivity.
 
-    Cleaning works value by value, in two steps:
+    Cleaning works value by value, in four steps:
       1. Physical range: any reading outside `limits[curve] = (min, max)` is
          set to NaN. This applies to every curve in CLEAN_CURVES that exists,
          whether or not it is a model input.
       2. Spikes (optional, `spike_pct` > 0): within EACH well, readings below
          the `spike_pct` percentile or above the 100 - `spike_pct` percentile
          are set to NaN. Done per well so one well's range can't clip another.
+      3. Depth interpolation (optional, `fill_max_gap` > 0): within EACH well,
+         interior gaps up to `fill_max_gap` consecutive samples long are filled
+         by depth-order linear interpolation. ILD is interpolated in log space.
+         The target curve is NEVER filled (its gaps are what we predict), and
+         gaps at the top or base of a well are not extrapolated.
+      4. Cross-log ML imputation (optional, `impute_cross_logs=True`): any
+         remaining missing values in input curves are filled by an
+         IterativeImputer (BayesianRidge regressors) fit SEPARATELY on each
+         well, using the relationships between the other logs at the same
+         depth. Fitting per well avoids any leakage between wells. Still
+         doesn't fill the target.
 
     Then rows are dropped only if a curve the model actually NEEDS is missing:
     the selected input curves, plus the `target` log (DT or DTS) when
@@ -261,13 +278,16 @@ def clean_data(df, feature_curves, limits, spike_pct=0.0, require_target=True,
     always a subset of the prediction rows.
 
     With `return_report=True`, also returns a table of how many values each
-    step removed per curve.
+    step removed or filled per curve.
     """
     cleaned = df.copy()
     report = []
 
     # Rows with no depth / well name are unusable
     cleaned = cleaned.dropna(subset=[c for c in ['DEPTH', 'WELL_NAME'] if c in cleaned.columns])
+
+    # Sort by depth within each well so interpolation goes in the right order
+    cleaned = cleaned.sort_values(['WELL_NAME', 'DEPTH']).reset_index(drop=True)
 
     curves = [c for c in CLEAN_CURVES if c in cleaned.columns]
     for c in curves:
@@ -296,11 +316,104 @@ def clean_data(df, feature_curves, limits, spike_pct=0.0, require_target=True,
             cleaned.loc[spikes, c] = np.nan
             n_spikes = int(spikes.sum())
 
+        # Step 3: fill short gaps by depth-order linear interpolation per well.
+        # Target is left alone (we predict it); edge gaps aren't extrapolated.
+        n_filled = 0
+        if fill_max_gap > 0 and c != target:
+            vals = cleaned[c]
+            if c in LOG_SCALE_CURVES:
+                work = np.log10(vals.where(vals > 0))
+            else:
+                work = vals
+            filled = (work.groupby(cleaned['WELL_NAME'])
+                          .transform(lambda s: s.interpolate(
+                              method='linear', limit=fill_max_gap,
+                              limit_area='inside')))
+            if c in LOG_SCALE_CURVES:
+                filled = 10 ** filled
+            n_filled = int((vals.isna() & filled.notna()).sum())
+            cleaned[c] = filled
+
         report.append({'Curve': c,
-                       'Valid readings (raw)': n_before,
+                       'Valid (raw)': n_before,
                        'Outside range': int(out_of_range.sum()),
                        'Spikes removed': n_spikes,
-                       'Valid after cleaning': int(cleaned[c].notna().sum())})
+                       'Gaps filled': n_filled,
+                       'ML-imputed': 0,
+                       'Valid after fill': int(cleaned[c].notna().sum())})
+
+    # Step 4: cross-log ML imputation (per well, zero leakage between wells).
+    # Fills whatever single-log interpolation couldn't reach — longer gaps,
+    # edge gaps, or sections where one log is missing but the others are
+    # running. Imputation is only applied at depths where enough other logs
+    # are already measured, so it fixes bad intervals rather than inventing
+    # data in zones that were never logged.
+    if impute_cross_logs and IterativeImputer is not None:
+        # Columns we can impute (not the target), plus target as a FEATURE
+        impute_cols = [c for c in curves if c != target]
+        helper_cols = ([target] if target in cleaned.columns else [])
+        use_cols = impute_cols + helper_cols
+        # "Anchor" curves: other logs that must be present for the imputation
+        # at a given depth to be trustworthy. Use the model's inputs when
+        # given; otherwise use the standard log set (not the target).
+        anchors = (feature_curves if feature_curves
+                   else [c for c in CLEAN_CURVES if c != target and c in cleaned.columns])
+        anchors = [c for c in anchors if c in cleaned.columns]
+        if len(use_cols) >= 2 and len(anchors) >= 2:
+            n_imputed = {c: 0 for c in impute_cols}
+            for well_name, g in cleaned.groupby('WELL_NAME', sort=False):
+                data = g[use_cols].astype(float).copy()
+                # ILD lives on a log scale; impute there, back-transform after
+                if 'ILD' in data.columns:
+                    data['ILD'] = np.log10(data['ILD'].where(data['ILD'] > 0))
+                # Drop columns that are entirely missing in this well — the
+                # imputer can't learn from them
+                keep = [c for c in use_cols if data[c].notna().any()]
+                if len(keep) < 2:
+                    continue
+                sub = data[keep]
+                # Need enough fully observed rows to fit the regressors
+                if sub.dropna().shape[0] < 20:
+                    continue
+                try:
+                    import warnings as _w
+                    with _w.catch_warnings():
+                        # IterativeImputer sometimes doesn't converge in max_iter —
+                        # the partial result is still useful, so silence the warning
+                        _w.simplefilter('ignore')
+                        imp = IterativeImputer(random_state=RANDOM_STATE, max_iter=10,
+                                               sample_posterior=False)
+                        filled = pd.DataFrame(imp.fit_transform(sub),
+                                              columns=keep, index=g.index)
+                except Exception:
+                    continue  # don't fail cleaning if a well's imputer errors
+                if 'ILD' in filled.columns:
+                    filled['ILD'] = 10 ** filled['ILD']
+                # Only impute at depths with at least 2 anchor curves present:
+                # stops extrapolation into intervals that were never logged.
+                anchor_count = cleaned.loc[g.index, anchors].notna().sum(axis=1)
+                enough = anchor_count >= 2
+                for c in impute_cols:
+                    if c not in filled.columns:
+                        continue
+                    # For each imputed curve, require at least 2 OTHER anchors
+                    # present (so we're not using the curve to predict itself)
+                    other_anchors = [a for a in anchors if a != c]
+                    if other_anchors:
+                        other_count = cleaned.loc[g.index, other_anchors].notna().sum(axis=1)
+                        safe = other_count >= min(2, len(other_anchors))
+                    else:
+                        safe = enough
+                    was_nan = cleaned.loc[g.index, c].isna()
+                    now_val = filled[c].notna()
+                    to_fill = was_nan & now_val & safe
+                    n_imputed[c] += int(to_fill.sum())
+                    cleaned.loc[g.index[to_fill], c] = filled.loc[to_fill, c]
+            # Update the report
+            for r in report:
+                if r['Curve'] in n_imputed:
+                    r['ML-imputed'] = n_imputed[r['Curve']]
+                    r['Valid after fill'] = int(cleaned[r['Curve']].notna().sum())
 
     # Keep only rows that have every curve the model needs
     needed = feature_curves + ([target] if require_target else [])
@@ -654,7 +767,8 @@ def build_las_zip(df, depth_unit, suffix="_predicted", target='DT'):
     return buf.getvalue()
 
 
-def cleaned_logs_for_export(df_raw, limits, spike_pct, include_other):
+def cleaned_logs_for_export(df_raw, limits, spike_pct, include_other, fill_max_gap=0,
+                            impute_cross_logs=False):
     """All logs after outlier cleaning, for export BEFORE any training.
 
     Unlike the training data, no rows are dropped for a missing input or
@@ -666,7 +780,9 @@ def cleaned_logs_for_export(df_raw, limits, spike_pct, include_other):
     include_other=True  -> also any other numeric curves from the LAS files
                            (e.g. PEF, DRHO). These are NOT outlier-cleaned.
     """
-    cleaned = clean_data(df_raw, [], limits, spike_pct, require_target=False)
+    cleaned = clean_data(df_raw, [], limits, spike_pct, require_target=False,
+                         fill_max_gap=fill_max_gap,
+                         impute_cross_logs=impute_cross_logs)
     std = [c for c in CLEAN_CURVES if c in cleaned.columns]
     if include_other:
         other = [c for c in cleaned.columns
@@ -899,8 +1015,19 @@ def render_apply_mode():
     # Same cleaning as when the model was trained
     limits_saved = {k: tuple(v) for k, v in meta['limits'].items()}
     df_pred, report = clean_data(df_new, req, limits_saved, meta.get('spike_pct', 0.0),
-                                 require_target=False, return_report=True, target=tgt)
-    with st.expander("Cleaning applied (same limits as when the model was trained)"):
+                                 require_target=False, return_report=True, target=tgt,
+                                 fill_max_gap=meta.get('fill_max_gap', 0),
+                                 impute_cross_logs=meta.get('impute_cross_logs', False))
+    with st.expander("Cleaning applied (same settings as when the model was trained)"):
+        _gap = meta.get('fill_max_gap', 0)
+        _imp = meta.get('impute_cross_logs', False)
+        _msgs = []
+        if _gap:
+            _msgs.append(f"short gaps up to **{_gap} samples** depth-interpolated")
+        if _imp:
+            _msgs.append("longer gaps filled by cross-log ML imputation (per well)")
+        if _msgs:
+            st.caption("Gap filling (same as training): " + "; ".join(_msgs) + ".")
         st.dataframe(pd.DataFrame(meta['limits'], index=['min', 'max']).T,
                      use_container_width=True)
         st.dataframe(report, use_container_width=True)
@@ -1066,7 +1193,7 @@ with st.sidebar:
         ild_max = c_hi.number_input("ILD max (ohm.m)", 0.01, 1e5, 2000.0, format="%.1f")
         limits['ILD'] = (ild_min, ild_max)
         limits['CALI'] = st.slider("CALI range (in)", 2.0, 30.0, (5.0, 20.0), 0.5)
-        limits['DT'] = st.slider("DT range (us/ft)", 20.0, 700.0, (40.0, 200.0), 1.0,
+        limits['DT'] = st.slider("DT range (us/ft)", 20.0, 700.0, (40.0, 200.0), 5.0,
                                  help="If your sonic is in us/m, widen this to about 130-660.")
         limits['DTS'] = st.slider("DTS range (us/ft)", 40.0, 1200.0, (60.0, 600.0), 10.0,
                                   help="Shear slowness. If it is in us/m, widen this to "
@@ -1078,6 +1205,27 @@ with st.sidebar:
             help="0 = off. E.g. 1% removes readings below the 1st and above the 99th "
                  "percentile of each curve, separately in each well. Catches spikes "
                  "that are still inside the physical range.")
+
+        st.markdown("**Fill missing sections**")
+        fill_max_gap = st.slider(
+            "Fill short gaps shorter than (samples)", 0, 200, 0, 5,
+            help="0 = off. Short gaps in the input logs are filled by depth-order "
+                 "linear interpolation within each well; ILD is filled in log space. "
+                 "Longer gaps and gaps at the top or base of a well stay missing — "
+                 "use the ML option below to fill those too. "
+                 "The target log is NEVER filled — its gaps are what you predict. "
+                 "LAS files are usually sampled every 0.1-0.15 m, so 20 samples "
+                 "fills gaps up to about 2-3 m.")
+        impute_cross_logs = st.checkbox(
+            "Also fill longer gaps using relationships between logs (ML)",
+            value=False,
+            help="Fills whatever's still missing in the input logs using an "
+                 "IterativeImputer (BayesianRidge regressions) fit SEPARATELY on "
+                 "each well — one well's relationships never leak into another's. "
+                 "Works for long gaps or whole intervals where one log is missing, "
+                 "as long as the other logs are present at those depths. The target "
+                 "log is still never filled. Use depth interpolation above for the "
+                 "short gaps, and this for the rest.")
 
     st.header("3. Validation")
     test_size = st.slider("Fraction of wells held out (blind)", 0.1, 0.5, 0.25, 0.05)
@@ -1151,7 +1299,9 @@ if limits['ILD'][0] >= limits['ILD'][1]:
     st.stop()
 
 df_clean, clean_report = clean_data(df_raw, available, limits, spike_pct,
-                                    return_report=True, target=target)
+                                    return_report=True, target=target,
+                                    fill_max_gap=fill_max_gap,
+                                    impute_cross_logs=impute_cross_logs)
 
 # Results are kept per target, so DT and DTS runs don't overwrite each other
 RES_KEY, FINAL_KEY = f'results_{target}', f'final_{target}'
@@ -1168,8 +1318,20 @@ with tab_data:
 
     st.subheader("Outlier cleaning per log")
     st.dataframe(clean_report, use_container_width=True)
-    st.caption("Counts are individual readings set to null. A row is only dropped from "
-               f"training if it loses a selected input curve or its {target}.")
+    _n_interp = int(clean_report['Gaps filled'].sum()) if 'Gaps filled' in clean_report else 0
+    _n_imput  = int(clean_report['ML-imputed'].sum()) if 'ML-imputed' in clean_report else 0
+    _msg = f"Counts are individual readings. A row is only dropped from training " \
+           f"if it loses a selected input curve or its {target}."
+    _parts = []
+    if _n_interp:
+        _parts.append(f"**{_n_interp:,}** depth-interpolated")
+    if _n_imput:
+        _parts.append(f"**{_n_imput:,}** filled by cross-log ML imputation")
+    if _parts:
+        _msg += " Gap filling: " + ", ".join(_parts) + "."
+    else:
+        _msg += " Enable gap filling in the sidebar to recover missing sections."
+    st.caption(_msg)
 
     st.subheader(f"Training rows per well (inputs + {target} all valid)")
     st.bar_chart(df_clean['WELL_NAME'].value_counts())
@@ -1186,7 +1348,9 @@ with tab_data:
         "Include other curves from the LAS files (not outlier-cleaned)", value=False,
         help="Off: only GR, RHOB, NPHI, ILD, CALI, DT and DTS. On: also curves like PEF "
              "or DRHO, exported exactly as read.")
-    df_export = cleaned_logs_for_export(df_raw, limits, spike_pct, include_other)
+    df_export = cleaned_logs_for_export(df_raw, limits, spike_pct, include_other,
+                                        fill_max_gap=fill_max_gap,
+                                        impute_cross_logs=impute_cross_logs)
     st.write(f"{df_export['WELL_NAME'].nunique()} wells, {len(df_export):,} rows, "
              f"curves: {', '.join(df_export.columns[2:])}")
 
@@ -1356,7 +1520,8 @@ with tab_final:
 
     # Rows we can predict: valid input curves, target NOT required
     df_predict = clean_data(df_raw, available, limits, spike_pct, require_target=False,
-                            target=target)
+                            target=target, fill_max_gap=fill_max_gap,
+                            impute_cross_logs=impute_cross_logs)
     n_train_wells = df_clean['WELL_NAME'].nunique()
 
     m1, m2, m3 = st.columns(3)
@@ -1402,6 +1567,8 @@ with tab_final:
                 'model_features': model_features,    # columns fed to the scaler
                 'limits': {k: [float(v[0]), float(v[1])] for k, v in limits.items()},
                 'spike_pct': float(spike_pct),
+                'fill_max_gap': int(fill_max_gap),
+                'impute_cross_logs': bool(impute_cross_logs),
                 'models': {c: lab for lab, c in final_new['pred_cols'].items()},
                 'hyperparameters': params,
                 'train_wells': sorted(df_clean['WELL_NAME'].unique()),
